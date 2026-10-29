@@ -215,11 +215,25 @@ async function generateWithGroq(input: GenerateTripInput, destination: Destinati
     }),
   });
   if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    let providerMessage = "";
+    try {
+      const parsed = JSON.parse(body) as { error?: { message?: unknown } | string; message?: unknown };
+      const errorMessage = typeof parsed.error === "object" && parsed.error !== null ? parsed.error.message : parsed.error;
+      providerMessage = typeof errorMessage === "string" ? errorMessage : typeof parsed.message === "string" ? parsed.message : "";
+    } catch { /* Ignore non-JSON provider error bodies. */ }
+    providerMessage = providerMessage
+      .replaceAll(key, "[redacted]")
+      .replace(/gsk_[A-Za-z0-9_-]+/g, "[redacted]")
+      .replace(/apiKey=[^&\s]+/gi, "apiKey=[redacted]")
+      .slice(0, 260);
     const detail = response.status === 401 || response.status === 403
       ? "Groq rejected the API key. Check GROQ_API_KEY and account access."
       : response.status === 429
         ? "Groq rate limit reached. Wait a little and try again."
-        : `Groq could not generate the itinerary (${response.status}). Try again or reduce the trip length.`;
+        : response.status === 400 && providerMessage
+          ? `Groq rejected the request (${response.status}): ${providerMessage}`
+          : `Groq could not generate the itinerary (${response.status})${providerMessage ? `: ${providerMessage}` : ". Check the model setting and request details."}`;
     throw new Error(detail);
   }
   const completion = await response.json() as { choices?: { message?: { content?: string | null; refusal?: string } }[] };
