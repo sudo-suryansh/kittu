@@ -2,7 +2,15 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { Budget, BudgetCategory, Coordinates, Destination, GenerateTripInput, ItineraryDay, ItineraryItem, Place, PlaceCategory, Trip, TripDNA, TransportationOption } from "@/lib/types";
 
-const model = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
+const strictStructuredOutputModels = new Set([
+  "openai/gpt-oss-20b",
+  "openai/gpt-oss-120b",
+  "qwen/qwen3.8-27b",
+]);
+const configuredModel = process.env.GROQ_MODEL?.trim();
+export const groqModel = configuredModel && strictStructuredOutputModels.has(configuredModel)
+  ? configuredModel
+  : "openai/gpt-oss-20b";
 const geoKey = () => process.env.GEOAPIFY_API_KEY;
 const tripDNA = (style: string, interests: string[]): TripDNA => {
   const result: TripDNA = { adventure: 30, culture: 30, relaxation: 30, food: 30, nature: 30, nightlife: 20 };
@@ -213,7 +221,7 @@ async function generateWithGroq(input: GenerateTripInput, destination: Destinati
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     signal: AbortSignal.timeout(55_000),
     body: JSON.stringify({
-      model,
+      model: groqModel,
       temperature: 0.2,
       reasoning_effort: "low",
       max_completion_tokens: maxCompletionTokens,
@@ -255,16 +263,45 @@ async function generateWithGroq(input: GenerateTripInput, destination: Destinati
   if (!parsed.success) throw new Error("Groq’s itinerary did not match TravelSetu’s required format. No plan was created.");
   if (parsed.data.days.length !== input.dayCount) throw new Error("Groq returned a different number of days than requested. No plan was created; please try once more.");
   const used = new Set<string>();
-  return parsed.data.days.map((day) => ({
-    ...day,
-    items: day.items.map((item) => {
-      const place = modelPlaceById.get(item.placeId);
-      if (!place) throw new Error("Groq selected a place outside the live map shortlist. No plan was created.");
-      if (used.has(place.id)) throw new Error("Groq repeated a place in the itinerary. No plan was created; please try once more.");
+  const allPlacesById = new Map(placeList.map((place) => [place.id, place]));
+  const distanceKm = (from: Place | undefined, to: Place) => {
+    if (!from) return 0;
+    const radians = Math.PI / 180;
+    const lat1 = from.coordinates.latitude * radians;
+    const lat2 = to.coordinates.latitude * radians;
+    const dLat = lat2 - lat1;
+    const dLon = (to.coordinates.longitude - from.coordinates.longitude) * radians;
+    const arc = 2 * Math.asin(Math.sqrt(Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2));
+    return 6371 * arc;
+  };
+  const nearbyUnusedPlace = (from: Place | undefined, dayUsed: Set<string>) => {
+    const candidates = [...modelPlaces].sort((a, b) => {
+      const aUsed = used.has(a.id) ? 1 : 0;
+      const bUsed = used.has(b.id) ? 1 : 0;
+      return aUsed - bUsed || distanceKm(from, a) - distanceKm(from, b);
+    });
+    return candidates.find((place) => !dayUsed.has(place.id));
+  };
+
+  return parsed.data.days.map((day) => {
+    const dayUsed = new Set<string>();
+    let previousPlace: Place | undefined;
+    const items = day.items.slice(0, 3).flatMap((item) => {
+      const alias = item.placeId.match(/^p(\d+)\b/i)?.[1];
+      let place = modelPlaceById.get(item.placeId) ?? (alias ? modelPlaceById.get(`p${Number(alias)}`) : undefined) ?? allPlacesById.get(item.placeId);
+      let substituted = false;
+      if (!place || used.has(place.id) || dayUsed.has(place.id)) {
+        place = nearbyUnusedPlace(previousPlace, dayUsed);
+        substituted = true;
+      }
+      if (!place) return [];
       used.add(place.id);
-      return { ...item, placeId: place.id };
-    }),
-  }));
+      dayUsed.add(place.id);
+      previousPlace = place;
+      return [{ ...item, placeId: place.id, ...(substituted ? { why: "Nearby live-map option substituted because Groq's place selection could not be matched." } : {}) }];
+    });
+    return { ...day, items };
+  });
 }
 
 function budgetFor(input: GenerateTripInput, days: number): Budget {
