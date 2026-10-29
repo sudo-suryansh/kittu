@@ -37,7 +37,8 @@ const schema = z.object({
   })),
 });
 
-const responseSchema = {
+function itineraryResponseSchema(placeIds: string[]) {
+  return {
   type: "object",
   properties: {
     days: {
@@ -52,7 +53,7 @@ const responseSchema = {
             items: {
               type: "object",
               properties: {
-                placeId: { type: "string" },
+                placeId: { type: "string", enum: placeIds },
                 timeOfDay: { type: "string", enum: ["Morning", "Afternoon", "Evening", "Night"] },
                 durationMin: { type: "integer" },
                 why: { type: "string" },
@@ -69,7 +70,8 @@ const responseSchema = {
   },
   required: ["days"],
   additionalProperties: false,
-} as const;
+  } as const;
+}
 
 async function geoJson<T>(path: string, params: Record<string, string>): Promise<T> {
   const key = geoKey();
@@ -203,7 +205,8 @@ async function generateWithGroq(input: GenerateTripInput, destination: Destinati
   // tokens describing every map feature.
   const candidateLimit = Math.min(32, Math.max(20, input.dayCount * 4 + 4));
   const modelPlaces = placeList.slice(0, candidateLimit);
-  const candidateData = modelPlaces.map((place) => ({ id: place.id, name: place.name, kind: place.category, area: place.neighborhood, lat: Number(place.coordinates.latitude.toFixed(3)), lon: Number(place.coordinates.longitude.toFixed(3)), freeEntryListed: place.feeKnown ? place.fee : null }));
+  const modelPlaceById = new Map(modelPlaces.map((place, index) => [`p${index + 1}`, place]));
+  const candidateData = modelPlaces.map((place, index) => ({ id: `p${index + 1}`, name: place.name, kind: place.category, area: place.neighborhood, lat: Number(place.coordinates.latitude.toFixed(3)), lon: Number(place.coordinates.longitude.toFixed(3)), freeEntryListed: place.feeKnown ? place.fee : null }));
   const maxCompletionTokens = Math.min(2200, 300 + input.dayCount * 280);
   const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
@@ -214,9 +217,9 @@ async function generateWithGroq(input: GenerateTripInput, destination: Destinati
       temperature: 0.2,
       reasoning_effort: "low",
       max_completion_tokens: maxCompletionTokens,
-      response_format: { type: "json_schema", json_schema: { name: "travelsetu_itinerary", strict: true, schema: responseSchema } },
+      response_format: { type: "json_schema", json_schema: { name: "travelsetu_itinerary", strict: true, schema: itineraryResponseSchema([...modelPlaceById.keys()]) } },
       messages: [
-        { role: "system", content: "Plan a practical India trip. Select only supplied place IDs; never invent a place. Return exactly the requested days, with 2–3 distinct stops per day when available. Keep each day geographically compact and do not repeat places. Match interests, food, pace, budget, transport, and group. Assign a time-of-day slot, but do not treat it as confirmed opening hours. Keep each `why` to one short sentence describing preference fit. Do not invent costs, schedules, weather, safety, or etiquette. If there are too few suitable places, use only the places provided." },
+        { role: "system", content: "Plan a practical India trip. Choose only supplied place IDs exactly as written (p1, p2, etc.); never invent a place or ID. Return exactly the requested days, with 2–3 distinct stops per day when available. Keep each day geographically compact and do not repeat places. Match interests, food, pace, budget, transport, and group. Assign a time-of-day slot, but do not treat it as confirmed opening hours. Keep each `why` to one short sentence describing preference fit. Do not invent costs, schedules, weather, safety, or etiquette. If there are too few suitable places, use only the places provided." },
         { role: "user", content: JSON.stringify({ task: "Create the itinerary", destination: `${destination.name}, ${destination.state}`, origin: input.originCity, days: input.dayCount, travelers: input.travelers, dailyBudgetINR: input.budgetPerDay, style: input.travelStyle, interests: input.interests, transport: input.preferredTransport, food: input.foodPreference, stay: input.accommodation, places: candidateData }) },
       ],
     }),
@@ -251,16 +254,17 @@ async function generateWithGroq(input: GenerateTripInput, destination: Destinati
   const parsed = schema.safeParse(parsedJson);
   if (!parsed.success) throw new Error("Groq’s itinerary did not match TravelSetu’s required format. No plan was created.");
   if (parsed.data.days.length !== input.dayCount) throw new Error("Groq returned a different number of days than requested. No plan was created; please try once more.");
-  const ids = new Set(modelPlaces.map((place) => place.id));
   const used = new Set<string>();
-  for (const day of parsed.data.days) {
-    for (const item of day.items) {
-      if (!ids.has(item.placeId)) throw new Error("Groq selected a place that was not returned by the live map data. No plan was created.");
-      if (used.has(item.placeId)) throw new Error("Groq repeated a place in the itinerary. No plan was created; please try once more.");
-      used.add(item.placeId);
-    }
-  }
-  return parsed.data.days;
+  return parsed.data.days.map((day) => ({
+    ...day,
+    items: day.items.map((item) => {
+      const place = modelPlaceById.get(item.placeId);
+      if (!place) throw new Error("Groq selected a place outside the live map shortlist. No plan was created.");
+      if (used.has(place.id)) throw new Error("Groq repeated a place in the itinerary. No plan was created; please try once more.");
+      used.add(place.id);
+      return { ...item, placeId: place.id };
+    }),
+  }));
 }
 
 function budgetFor(input: GenerateTripInput, days: number): Budget {
