@@ -198,7 +198,13 @@ export async function searchNearbyPlaces(query: string, center: Coordinates, des
 async function generateWithGroq(input: GenerateTripInput, destination: Destination, placeList: Place[]) {
   const key = process.env.GROQ_API_KEY;
   if (!key) throw new Error("GROQ_API_KEY is not configured. Add a Groq key in .env.local to generate a real itinerary.");
-  const candidateData = placeList.map((place) => ({ id: place.id, name: place.name, category: place.category, neighborhood: place.neighborhood, coordinates: place.coordinates, listedHours: place.openingHours, knownFree: place.feeKnown ? place.fee : null }));
+  // Geoapify already biases this list by proximity. Keep only nearby options in the
+  // prompt; send the complete listing to the UI for discovery, but don't spend model
+  // tokens describing every map feature.
+  const candidateLimit = Math.min(32, Math.max(20, input.dayCount * 4 + 4));
+  const modelPlaces = placeList.slice(0, candidateLimit);
+  const candidateData = modelPlaces.map((place) => ({ id: place.id, name: place.name, kind: place.category, area: place.neighborhood, lat: Number(place.coordinates.latitude.toFixed(3)), lon: Number(place.coordinates.longitude.toFixed(3)), freeEntryListed: place.feeKnown ? place.fee : null }));
+  const maxCompletionTokens = Math.min(2200, 300 + input.dayCount * 280);
   const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
@@ -206,11 +212,12 @@ async function generateWithGroq(input: GenerateTripInput, destination: Destinati
     body: JSON.stringify({
       model,
       temperature: 0.2,
-      max_completion_tokens: 5000,
+      reasoning_effort: "low",
+      max_completion_tokens: maxCompletionTokens,
       response_format: { type: "json_schema", json_schema: { name: "travelsetu_itinerary", strict: true, schema: responseSchema } },
       messages: [
-        { role: "system", content: "You plan practical trips in India. Use only the supplied map-provider places and IDs. Never create or rename a place. Build one compact, geographically coherent day at a time, with 2–4 distinct places per day when enough data exists. Do not repeat places across days. Match the requested food, interests, pace, budget, transport, and travel party. Use approximate time-of-day sequencing, but do not infer opening hours from time slots. The `why` field is a preference match, not a claim about current conditions. Do not invent costs, ticket prices, transit schedules, weather, safety, or cultural rules. Return exactly the requested number of days. If fewer than 2–4 suitable places are available, use only those that exist." },
-        { role: "user", content: JSON.stringify({ task: "Select and sequence a day-by-day itinerary", trip: { destination: destination.name, state: destination.state, originCity: input.originCity, days: input.dayCount, travelers: input.travelers, budgetPerPersonPerDayINR: input.budgetPerDay, travelStyle: input.travelStyle, interests: input.interests, transportPreference: input.preferredTransport, foodPreference: input.foodPreference, accommodationPreference: input.accommodation }, availablePlaces: candidateData }) },
+        { role: "system", content: "Plan a practical India trip. Select only supplied place IDs; never invent a place. Return exactly the requested days, with 2–3 distinct stops per day when available. Keep each day geographically compact and do not repeat places. Match interests, food, pace, budget, transport, and group. Assign a time-of-day slot, but do not treat it as confirmed opening hours. Keep each `why` to one short sentence describing preference fit. Do not invent costs, schedules, weather, safety, or etiquette. If there are too few suitable places, use only the places provided." },
+        { role: "user", content: JSON.stringify({ task: "Create the itinerary", destination: `${destination.name}, ${destination.state}`, origin: input.originCity, days: input.dayCount, travelers: input.travelers, dailyBudgetINR: input.budgetPerDay, style: input.travelStyle, interests: input.interests, transport: input.preferredTransport, food: input.foodPreference, stay: input.accommodation, places: candidateData }) },
       ],
     }),
   });
@@ -230,7 +237,7 @@ async function generateWithGroq(input: GenerateTripInput, destination: Destinati
     const detail = response.status === 401 || response.status === 403
       ? "Groq rejected the API key. Check GROQ_API_KEY and account access."
       : response.status === 429
-        ? "Groq rate limit reached. Wait a little and try again."
+        ? `Groq rate limit reached${response.headers.get("retry-after") ? `; try again in about ${response.headers.get("retry-after")} seconds` : "; wait for the account quota to reset"}.${providerMessage ? ` ${providerMessage}` : ""}`
         : response.status === 400 && providerMessage
           ? `Groq rejected the request (${response.status}): ${providerMessage}`
           : `Groq could not generate the itinerary (${response.status})${providerMessage ? `: ${providerMessage}` : ". Check the model setting and request details."}`;
@@ -244,7 +251,7 @@ async function generateWithGroq(input: GenerateTripInput, destination: Destinati
   const parsed = schema.safeParse(parsedJson);
   if (!parsed.success) throw new Error("Groq’s itinerary did not match TravelSetu’s required format. No plan was created.");
   if (parsed.data.days.length !== input.dayCount) throw new Error("Groq returned a different number of days than requested. No plan was created; please try once more.");
-  const ids = new Set(placeList.map((place) => place.id));
+  const ids = new Set(modelPlaces.map((place) => place.id));
   const used = new Set<string>();
   for (const day of parsed.data.days) {
     for (const item of day.items) {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AboutPage, BudgetPlanner, DayDetail, DestinationExplorer, ExampleItinerary, IndiaGuide, LandingFooter, PreferencesPage, SavedTrips, TripDNAPage } from "@/components/trip-pages";
 import { BrandMark, Icon } from "@/components/icons";
 import { ItineraryWorkspace } from "@/components/itinerary-workspace";
@@ -29,6 +29,7 @@ export function TravelSetuApp({ exampleTrip }: { exampleTrip: Trip }) {
   const [trip, setTrip] = useState<Trip | null>(null);
   const [activeDay, setActiveDay] = useState(0);
   const [busy, setBusy] = useState(false);
+  const planRequestInFlight = useRef(false);
   const [error, setError] = useState("");
   const [catalog, setCatalog] = useState<{ destinations: Destination[]; places: Place[] }>({ destinations: [], places: [] });
   const [selectedDestination, setSelectedDestination] = useState("Delhi");
@@ -50,6 +51,8 @@ export function TravelSetuApp({ exampleTrip }: { exampleTrip: Trip }) {
   const explorePlaces = useMemo(() => catalog.places, [catalog.places]);
 
   async function createPlan(input: GenerateTripInput) {
+    if (planRequestInFlight.current) return;
+    planRequestInFlight.current = true;
     setBusy(true); setError("");
     try {
       const userId = makeClientId();
@@ -59,11 +62,12 @@ export function TravelSetuApp({ exampleTrip }: { exampleTrip: Trip }) {
       setTrip(data.trip as Trip); setCatalog((current) => ({ ...current, places: (data.trip as Trip).candidatePlaces ?? [] })); setSelectedDestination((data.trip as Trip).destination.name); setActiveDay(0); setPage("itinerary");
       window.setTimeout(() => document.getElementById("trip-workspace")?.scrollIntoView({ behavior: "smooth", block: "start" }), 80);
     } catch (cause) { setError(cause instanceof Error ? cause.message : "We couldn’t build that trip yet."); }
-    finally { setBusy(false); }
+    finally { planRequestInFlight.current = false; setBusy(false); }
   }
 
   const adjust = useCallback(async (adjustment: TripAdjustment, dayIndex = activeDay, dailyTarget?: number, experience?: Place) => {
-    if (!trip) return;
+    if (!trip || planRequestInFlight.current) return;
+    planRequestInFlight.current = true;
     setBusy(true); setError("");
     try {
       const response = await fetch(`/api/trips/${trip.id}/adjust`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ trip, adjustment, dayIndex, dailyTarget, experience }) });
@@ -72,7 +76,7 @@ export function TravelSetuApp({ exampleTrip }: { exampleTrip: Trip }) {
       setTrip(data.trip as Trip);
       if (adjustment === "add-day") setActiveDay((data.trip as Trip).days.length - 1);
     } catch (cause) { setError(cause instanceof Error ? cause.message : "We couldn’t update that part of the trip."); }
-    finally { setBusy(false); }
+    finally { planRequestInFlight.current = false; setBusy(false); }
   }, [trip, activeDay]);
 
   async function editItem(action: ItineraryItemAction, itemId: string, value?: string | number) {
