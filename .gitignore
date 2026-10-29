@@ -1,0 +1,11 @@
+.next/
+node_modules/
+dist/
+build/
+.env
+.env.*
+!.env.example
+*.log
+coverage/
+prisma/*.db
+*.tsbuildinfo
